@@ -785,41 +785,106 @@ async def get_ranking_section(name: str):
 
 
 # ═══════════════════════════════════════════════════════════════
-# SEARCH — FIXED
+# SEARCH — FIXED (v2)
 # ═══════════════════════════════════════════════════════════════
-# Bug: aoneroom's h5-api backend silently rejects POST requests
-# that don't carry a Referer/Origin pointing to moviebox.ph.
-# Every other route already sends this; search did not — causing
-# the 500 errors. Fixed by reusing H5_API_HEADERS everywhere.
+# Root cause: aoneroom's h5-api requires an established session
+# (a "uuid" cookie minted by visiting the site first) before it will
+# accept search POSTs — calling search "cold" returns 400.
+# This mirrors exactly what /api/stream already does via get-domain.
+# Fix: warm up a session cookie first, then reuse it for search.
+# Also added a fallback that scrapes moviebox.ph filter pages and
+# matches titles client-side if the aoneroom search API is down.
 # ═══════════════════════════════════════════════════════════════
+
+async def _h5_search_request(endpoint: str, payload: dict) -> dict:
+    url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/{endpoint}"
+    headers = {**H5_API_HEADERS}
+    session_uuid = str(uuid.uuid4())
+    cookies = {"uuid": session_uuid}
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        # Warm up: visit the homepage once to establish a valid session
+        # before the POST — mirrors real browser behavior where cookies
+        # already exist before any search is issued.
+        try:
+            await client.get(
+                "https://moviebox.ph/",
+                headers={"User-Agent": H5_API_HEADERS["User-Agent"], "Referer": "https://moviebox.ph/"},
+                cookies=cookies,
+                timeout=10,
+            )
+        except Exception:
+            pass  # Warm-up failure shouldn't block the real request
+
+        resp = await client.post(url, json=payload, headers=headers, cookies=cookies, timeout=15)
+
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Search API returned {resp.status_code}. Response: {resp.text[:200]}"
+            )
+
+        try:
+            return resp.json()
+        except Exception:
+            raise HTTPException(status_code=502, detail="Search API returned invalid JSON")
+
+
+async def _fallback_scrape_search(q: str) -> list[dict]:
+    """Fallback search: scrape /web/movie and /web/tv-series filter pages
+    and match titles client-side. Used only if the aoneroom search API
+    is unavailable, to keep search functional end-to-end regardless."""
+    q_lower = q.lower().strip()
+    results = []
+    for path in ("/web/movie", "/web/tv-series"):
+        try:
+            sections, _ = await _tab_sections(path)
+            for section in sections:
+                for m in section.get("movies", []):
+                    name = (m.get("name") or "").lower()
+                    if q_lower in name:
+                        results.append({
+                            "name": m.get("name"),
+                            "poster_url": m.get("poster_url"),
+                            "url": m.get("url"),
+                            "slug": m.get("slug"),
+                            "badge": m.get("badge"),
+                            "blurhash": m.get("blurhash"),
+                        })
+        except Exception:
+            continue
+    return results[:30]
+
 
 @app.get("/search/suggest")
 async def get_search_suggestions(q: str):
-    url = "https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/search-suggest"
-    payload = {"keyword": q, "perPage": 10}
-    headers = {**H5_API_HEADERS}
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        resp = await client.post(url, json=payload, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Search suggest API returned {resp.status_code}")
-        data = resp.json()
+    try:
+        data = await _h5_search_request(
+            "subject/search-suggest",
+            {"keyword": q, "perPage": 10}
+        )
         items = data.get("data", {}).get("items", [])
         suggestions = [item.get("word") for item in items if item.get("word")]
-        return {"query": q, "suggestions": suggestions}
+        if suggestions:
+            return {"query": q, "suggestions": suggestions}
+    except HTTPException:
+        pass
+
+    # Fallback: derive suggestions from scraped titles
+    fallback = await _fallback_scrape_search(q)
+    suggestions = list(dict.fromkeys([m["name"] for m in fallback if m.get("name")]))[:10]
+    return {"query": q, "suggestions": suggestions}
 
 
 @app.get("/search")
 async def get_search_results(q: str):
-    url = "https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/search"
-    payload = {"keyword": q, "perPage": 30, "page": 1}
-    headers = {**H5_API_HEADERS}
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        resp = await client.post(url, json=payload, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Search API returned {resp.status_code}")
-        data = resp.json()
+    movies = []
+    try:
+        data = await _h5_search_request(
+            "subject/search",
+            {"keyword": q, "perPage": 30, "page": 1}
+        )
         items = data.get("data", {}).get("items", [])
-        movies = []
         for sub in items:
             name = sub.get("title")
             poster = sub.get("cover", {}).get("url")
@@ -832,11 +897,19 @@ async def get_search_results(q: str):
                 "badge": sub.get("corner"),
                 "blurhash": sub.get("cover", {}).get("blurHash")
             })
-        return {
-            "query": q,
-            "count": len(movies),
-            "movies": movies
-        }
+    except HTTPException:
+        pass
+
+    # Fallback: if aoneroom search yields nothing (or errored), fall back
+    # to scraping the moviebox.ph movie/tv-series filter pages.
+    if not movies:
+        movies = await _fallback_scrape_search(q)
+
+    return {
+        "query": q,
+        "count": len(movies),
+        "movies": movies
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -868,12 +941,26 @@ async def get_stream_sources(subject_id: str, detail_path: str, se: int = 0, ep:
     domain_url = "https://h5-api.aoneroom.com/wefeed-h5api-bff/media-player/get-domain"
     domain = "https://123movienow.cc"  # fallback
 
-    domain_headers = {**H5_API_HEADERS}
-
     async with httpx.AsyncClient(follow_redirects=True) as client:
+        # FIX: fresh random session uuid per request, and warm it up
+        # by visiting the homepage first — aoneroom's play endpoint
+        # returns 403 for "cold" sessions that never touched the site.
+        session_uuid = str(uuid.uuid4())
+        cookies = {"uuid": session_uuid}
+
+        try:
+            await client.get(
+                "https://moviebox.ph/",
+                headers={"User-Agent": H5_API_HEADERS["User-Agent"], "Referer": "https://moviebox.ph/"},
+                cookies=cookies,
+                timeout=10,
+            )
+        except Exception:
+            pass
+
         domain_warning = None
         try:
-            r_dom = await client.get(domain_url, headers=domain_headers, timeout=8)
+            r_dom = await client.get(domain_url, headers=domain_headers, cookies=cookies, timeout=8)
             if r_dom.status_code == 200:
                 dom_data = r_dom.json()
                 fetched_domain = dom_data.get("data")
@@ -901,19 +988,33 @@ async def get_stream_sources(subject_id: str, detail_path: str, se: int = 0, ep:
             'origin': domain,
         }
 
-        # FIX: fresh random session uuid per request instead of a
-        # hardcoded one — aoneroom's session validation can flag
-        # reused cookies as suspicious/stale over time.
-        cookies = {
-            "uuid": str(uuid.uuid4())
-        }
-
         try:
             resp = await client.get(play_url, headers=play_headers, cookies=cookies, timeout=20)
         except httpx.RequestError as e:
             raise HTTPException(status_code=502, detail=f"Failed to reach player API: {e}")
 
         if resp.status_code != 200:
+            # FIX: on 403 specifically, fall back to /detail mp4 links
+            # immediately rather than failing outright — the play API
+            # being blocked doesn't mean we have no usable stream.
+            if resp.status_code == 403:
+                try:
+                    fallback = await get_movie_detail(detail_path)
+                    fallback_mp4 = fallback.get("streams", {}).get("mp4", [])
+                    if fallback_mp4:
+                        return {
+                            "subject_id": subject_id,
+                            "detail_path": detail_path,
+                            "season": se,
+                            "episode": ep,
+                            "stream_domain": domain,
+                            "count": len(fallback_mp4),
+                            "sources": [{"resolution": "Unknown", "format": "mp4", "url": u, "size_bytes": None, "id": None} for u in fallback_mp4],
+                            "raw": {},
+                            "note": "Player API returned 403; fell back to /detail mp4 links",
+                        }
+                except Exception:
+                    pass
             raise HTTPException(
                 status_code=502,
                 detail=f"Player API returned {resp.status_code}. {domain_warning or ''}".strip()
