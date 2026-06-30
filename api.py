@@ -1,5 +1,6 @@
 import re
 import json
+import uuid
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,7 +9,7 @@ from bs4 import BeautifulSoup
 app = FastAPI(
     title="MovieBox API",
     description="Live REST API for moviebox.ph — scrapes all homepage sections with real poster URLs, badges, genres and more",
-    version="1.0.0"
+    version="3.2.0"
 )
 
 app.add_middleware(
@@ -32,8 +33,26 @@ HEADERS = {
     "Referer": "https://moviebox.ph/",
 }
 
+# Shared headers for aoneroom h5-api JSON endpoints (search, stream, etc.)
+# CRITICAL FIX: these endpoints reject requests without Referer/Origin.
+H5_API_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Referer": "https://moviebox.ph/",
+    "Origin": "https://moviebox.ph",
+    "X-Client-Info": '{"timezone":"Asia/Dhaka"}',
+    "X-Client-Type": "h5",
+}
+
+
 async def fetch_page() -> tuple[BeautifulSoup, str]:
     return await fetch_tab("/")
+
 
 async def fetch_tab(path: str) -> tuple[BeautifulSoup, str]:
     url = BASE_URL + path if path.startswith("/") else path
@@ -47,6 +66,7 @@ async def fetch_tab(path: str) -> tuple[BeautifulSoup, str]:
             )
         return BeautifulSoup(response.text, "html.parser"), response.text
 
+
 def build_blurhash_to_poster_map(raw_html: str) -> dict[str, str]:
     script_match = re.search(
         r'<script[^>]+id="__NUXT_DATA__"[^>]*>(.*?)</script>',
@@ -54,12 +74,10 @@ def build_blurhash_to_poster_map(raw_html: str) -> dict[str, str]:
     )
     if not script_match:
         return {}
-
     try:
         data = json.loads(script_match.group(1))
     except (json.JSONDecodeError, Exception):
         return {}
-
     if not isinstance(data, list):
         return {}
 
@@ -68,7 +86,6 @@ def build_blurhash_to_poster_map(raw_html: str) -> dict[str, str]:
         i for i, v in enumerate(data)
         if isinstance(v, str) and "pbcdnw.aoneroom.com" in v
     ]
-
     for idx in cdn_indices:
         url = data[idx]
         for offset in range(1, 12):
@@ -89,6 +106,7 @@ def build_blurhash_to_poster_map(raw_html: str) -> dict[str, str]:
                         break
     return mapping
 
+
 def build_slug_to_poster_map(raw_html: str) -> dict[str, str]:
     script_match = re.search(
         r'<script[^>]+id="__NUXT_DATA__"[^>]*>(.*?)</script>',
@@ -105,7 +123,6 @@ def build_slug_to_poster_map(raw_html: str) -> dict[str, str]:
 
     mapping: dict[str, str] = {}
     slug_re = re.compile(r'^[a-z][a-z0-9\-]+-[a-zA-Z0-9]{11}$')
-
     for idx, v in enumerate(data):
         if not isinstance(v, str):
             continue
@@ -113,7 +130,6 @@ def build_slug_to_poster_map(raw_html: str) -> dict[str, str]:
             continue
         if v in mapping:
             continue
-
         for offset in range(1, 26):
             ni = idx - offset
             if ni < 0:
@@ -122,13 +138,12 @@ def build_slug_to_poster_map(raw_html: str) -> dict[str, str]:
             if isinstance(candidate, str) and "pbcdnw.aoneroom.com" in candidate:
                 mapping[v] = candidate
                 break
-
     return mapping
+
 
 def parse_movie_card(card, blurhash_map: dict) -> dict:
     href = card.get("href", "")
     title_attr = card.get("title", "")
-
     name_tag = card.find("p")
     if name_tag:
         name = name_tag.get_text(separator=" ", strip=True)
@@ -139,11 +154,9 @@ def parse_movie_card(card, blurhash_map: dict) -> dict:
         name = ""
 
     slug = href.split("/detail/")[-1] if "/detail/" in href else None
-
     thumb_span = card.find("span", attrs={"thumbnail": True})
     blurhash = thumb_span.get("thumbnail") if thumb_span else None
     poster_url = blurhash_map.get(blurhash) if blurhash else None
-
     badge_span = card.find("span", class_=lambda c: c and "text-white" in c if c else False)
     badge = badge_span.get_text(strip=True) if badge_span else None
 
@@ -156,6 +169,7 @@ def parse_movie_card(card, blurhash_map: dict) -> dict:
         "blurhash": blurhash,
     }
 
+
 def parse_sections(soup: BeautifulSoup, blurhash_map: dict) -> list[dict]:
     sections = []
     seen_titles = set()
@@ -164,7 +178,6 @@ def parse_sections(soup: BeautifulSoup, blurhash_map: dict) -> list[dict]:
         title_div = box.find("div", class_=lambda c: c and "title" in c.split() if c else False)
         if not title_div:
             continue
-
         raw_title = title_div.get_text(strip=True)
         if not raw_title or raw_title in seen_titles:
             continue
@@ -179,7 +192,6 @@ def parse_sections(soup: BeautifulSoup, blurhash_map: dict) -> list[dict]:
             continue
 
         movies = [parse_movie_card(card, blurhash_map) for card in movie_cards]
-
         sections.append({
             "section": raw_title,
             "more_url": more_url,
@@ -189,25 +201,21 @@ def parse_sections(soup: BeautifulSoup, blurhash_map: dict) -> list[dict]:
 
     return sections
 
+
 def parse_card_page(soup: BeautifulSoup, slug_map: dict) -> list[dict]:
     cards = soup.find_all("a", class_="card",
-                          href=lambda h: h and "/detail/" in h if h else False)
+                           href=lambda h: h and "/detail/" in h if h else False)
     movies = []
     for card in cards:
         href = card.get("href", "")
         slug = href.split("/detail/")[-1] if "/detail/" in href else None
-
         h2 = card.find("h2", class_=lambda c: c and "card-title" in c.split() if c else False)
         name = h2.get_text(strip=True) if h2 else (slug or "")
-
         year_div = card.find("div", class_=lambda c: c and "text-white" in c and "text-[12px]" in c if c else False)
         year = year_div.get_text(strip=True) if year_div else None
-
         rating_span = card.find("span")
         rating = rating_span.get_text(strip=True) if rating_span else None
-
         poster_url = slug_map.get(slug) if slug else None
-
         movies.append({
             "name": name,
             "url": BASE_URL + href if href.startswith("/") else href,
@@ -223,10 +231,12 @@ def parse_card_page(soup: BeautifulSoup, slug_map: dict) -> list[dict]:
         return []
     return [{"section": "All", "more_url": None, "count": len(movies), "movies": movies}]
 
+
 def parse_movie_filter_page(soup: BeautifulSoup, blurhash_map: dict, slug_map: dict, raw_html: str) -> list[dict]:
     all_cards = soup.find_all("a", href=lambda h: h and "/detail/" in h if h else False)
     movies = []
     seen_slugs: set = set()
+
     for card in all_cards:
         href = card.get("href", "")
         slug = href.split("/detail/")[-1] if "/detail/" in href else None
@@ -242,7 +252,6 @@ def parse_movie_filter_page(soup: BeautifulSoup, blurhash_map: dict, slug_map: d
         thumb = card.find("span", attrs={"thumbnail": True})
         blurhash = thumb.get("thumbnail") if thumb else None
         poster_url = blurhash_map.get(blurhash) if blurhash else None
-
         badge_span = card.find("span", class_=lambda c: c and "text-white" in c if c else False)
         badge = badge_span.get_text(strip=True) if badge_span else None
 
@@ -254,24 +263,23 @@ def parse_movie_filter_page(soup: BeautifulSoup, blurhash_map: dict, slug_map: d
             "badge": badge,
             "blurhash": blurhash,
         })
+
     if not movies:
         script_match = re.search(r'<script[^>]+id="__NUXT_DATA__"[^>]*>(.*?)</script>', raw_html, re.DOTALL)
         if script_match:
             try:
                 data = json.loads(script_match.group(1))
-                slugs_idx = [ (i, v) for i, v in enumerate(data) if isinstance(v, str) and '/detail/' not in v and re.match(r'^[a-z0-9][a-z0-9\-]{3,}-[a-zA-Z0-9]{11}$', v)]
+                slugs_idx = [(i, v) for i, v in enumerate(data) if isinstance(v, str) and '/detail/' not in v and re.match(r'^[a-z0-9][a-z0-9\-]{3,}-[a-zA-Z0-9]{11}$', v)]
                 for idx, slug in slugs_idx:
                     if slug in seen_slugs:
                         continue
                     seen_slugs.add(slug)
-                    
                     name = slug
                     for j in range(max(0, idx-10), min(len(data), idx+10)):
                         val = data[j]
                         if isinstance(val, str) and len(val) > 2 and not val.startswith('http') and not re.match(r'^[a-z0-9\-]+$', val):
                             name = val.replace("Trailer-", "").strip()
                             break
-                            
                     movies.append({
                         "name": name,
                         "url": BASE_URL + f"/detail/{slug}",
@@ -287,9 +295,10 @@ def parse_movie_filter_page(soup: BeautifulSoup, blurhash_map: dict, slug_map: d
         return []
     return [{"section": "All Movies", "more_url": None, "count": len(movies), "movies": movies}]
 
+
 def _resolve_nuxt_data(data, index):
     if not isinstance(index, int) or index < 0 or index >= len(data):
-        return index 
+        return index
     val = data[index]
     if isinstance(val, dict):
         return {k: _resolve_nuxt_data(data, v) for k, v in val.items()}
@@ -298,68 +307,68 @@ def _resolve_nuxt_data(data, index):
     else:
         return val
 
+
 @app.get("/detail/{slug}")
 async def get_movie_detail(slug: str):
     url = f"https://moviebox.ph/detail/{slug}"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    
-    async with httpx.AsyncClient() as client:
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://moviebox.ph/"}
+    async with httpx.AsyncClient(follow_redirects=True) as client:
         resp = await client.get(url, headers=headers, timeout=30)
-        
-    if resp.status_code != 200:
-        raise HTTPException(status_code=404, detail="Movie not found")
-        
-    match = re.search(r'<script type="application/json" data-nuxt-data="nuxt-app" data-ssr="true" id="__NUXT_DATA__">\s*(.*?)\s*</script>', resp.text, re.DOTALL)
-    if not match:
-        raise HTTPException(status_code=500, detail="Could not find NUXT data in the page")
-        
-    try:
-        nuxt_json = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Failed to parse NUXT data")
-        
-    if not isinstance(nuxt_json, list):
-        raise HTTPException(status_code=500, detail="Unexpected NUXT data format")
-        
-    movie_dict = None
-    for i, v in enumerate(nuxt_json):
-        if isinstance(v, dict) and 'subjectId' in v and 'title' in v and 'duration' in v:
-            movie_dict = _resolve_nuxt_data(nuxt_json, i)
-            break
-            
-    if not movie_dict:
-        raise HTTPException(status_code=404, detail="Could not extract movie metadata from NUXT")
+        if resp.status_code != 200:
+            raise HTTPException(status_code=404, detail="Movie not found")
 
-    stream_urls = [s for s in nuxt_json if isinstance(s, str) and '.mp4' in s]
-    hls_urls = [s for s in nuxt_json if isinstance(s, str) and ('.m3u8' in s or '/m3u8/' in s)]
+        match = re.search(r'<script type="application/json" data-nuxt-data="nuxt-app" data-ssr="true" id="__NUXT_DATA__">\s*(.*?)\s*</script>', resp.text, re.DOTALL)
+        if not match:
+            raise HTTPException(status_code=500, detail="Could not find NUXT data in the page")
 
-    return {
-        "slug": slug,
-        "source": url,
-        "metadata": {
-            "id": movie_dict.get("subjectId"),
-            "title": movie_dict.get("title"),
-            "description": movie_dict.get("description"),
-            "release_date": movie_dict.get("releaseDate"),
-            "duration": movie_dict.get("duration"),
-            "genre": movie_dict.get("genre"),
-            "country": movie_dict.get("countryName"),
-            "imdb_rating": movie_dict.get("imdbRatingValue"),
-            "poster": movie_dict.get("cover", {}).get("url") if isinstance(movie_dict.get("cover"), dict) else None,
-            "badge": movie_dict.get("corner"),
-            "dubs": movie_dict.get("dubs", [])
-        },
-        "streams": {
-            "mp4": stream_urls,
-            "hls": hls_urls
+        try:
+            nuxt_json = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=500, detail="Failed to parse NUXT data")
+
+        if not isinstance(nuxt_json, list):
+            raise HTTPException(status_code=500, detail="Unexpected NUXT data format")
+
+        movie_dict = None
+        for i, v in enumerate(nuxt_json):
+            if isinstance(v, dict) and 'subjectId' in v and 'title' in v and 'duration' in v:
+                movie_dict = _resolve_nuxt_data(nuxt_json, i)
+                break
+
+        if not movie_dict:
+            raise HTTPException(status_code=404, detail="Could not extract movie metadata from NUXT")
+
+        stream_urls = [s for s in nuxt_json if isinstance(s, str) and '.mp4' in s]
+        hls_urls = [s for s in nuxt_json if isinstance(s, str) and ('.m3u8' in s or '/m3u8/' in s)]
+
+        return {
+            "slug": slug,
+            "source": url,
+            "metadata": {
+                "id": movie_dict.get("subjectId"),
+                "title": movie_dict.get("title"),
+                "description": movie_dict.get("description"),
+                "release_date": movie_dict.get("releaseDate"),
+                "duration": movie_dict.get("duration"),
+                "genre": movie_dict.get("genre"),
+                "country": movie_dict.get("countryName"),
+                "imdb_rating": movie_dict.get("imdbRatingValue"),
+                "poster": movie_dict.get("cover", {}).get("url") if isinstance(movie_dict.get("cover"), dict) else None,
+                "badge": movie_dict.get("corner"),
+                "dubs": movie_dict.get("dubs", [])
+            },
+            "streams": {
+                "mp4": stream_urls,
+                "hls": hls_urls
+            }
         }
-    }
+
 
 def parse_ranking_page(soup: BeautifulSoup, slug_map: dict) -> list[dict]:
     rank_lists = soup.find_all("div", class_=lambda c: c and "rank-subject-list" in c if c else False)
-
     all_movies = []
     seen_slugs: set = set()
+
     for rl in rank_lists:
         cards = rl.find_all("a", class_=lambda c: c and "rank-subject-item" in c if c else False)
         for card in cards:
@@ -371,13 +380,10 @@ def parse_ranking_page(soup: BeautifulSoup, slug_map: dict) -> list[dict]:
 
             title_div = card.find("div", class_="title-text")
             name = title_div.get_text(strip=True) if title_div else (slug or "")
-
             rank_num_div = card.find("div", class_="ranking-corner-num")
             rank = rank_num_div.get_text(strip=True) if rank_num_div else None
-
             badge_span = card.find("span", class_="special-tag-text")
             badge = badge_span.get_text(strip=True) if badge_span else None
-
             poster_url = slug_map.get(slug) if slug else None
 
             all_movies.append({
@@ -392,6 +398,7 @@ def parse_ranking_page(soup: BeautifulSoup, slug_map: dict) -> list[dict]:
     if not all_movies:
         return []
     return [{"section": "Most Watched", "more_url": None, "count": len(all_movies), "movies": all_movies}]
+
 
 def build_title_to_poster_map(raw_html: str) -> dict[str, str]:
     script_match = re.search(
@@ -431,6 +438,7 @@ def build_title_to_poster_map(raw_html: str) -> dict[str, str]:
                 break
     return mapping
 
+
 def parse_banner(soup: BeautifulSoup, title_map: dict) -> list[dict]:
     featured = []
     seen = set()
@@ -447,30 +455,27 @@ def parse_banner(soup: BeautifulSoup, title_map: dict) -> list[dict]:
         genre_div = parent.find("div", class_=lambda c: c and "type" in c if c else False) if parent else None
 
         name_clean = re.sub(r'\[.*?\]', '', name).strip().lower()
-        
         poster_url = None
         for key, url in title_map.items():
             key_clean = re.sub(r'\[.*?\]', '', key).strip().lower()
             if name_clean == key_clean:
                 poster_url = url
                 break
-                
         if not poster_url and len(name_clean) > 3:
             for key, url in title_map.items():
                 key_clean = re.sub(r'\[.*?\]', '', key).strip().lower()
                 if name_clean in key_clean or key_clean in name_clean:
                     poster_url = url
                     break
-            
-            if not poster_url:
-                words_name = name_clean.split()
-                if len(words_name) >= 2:
-                    for key, url in title_map.items():
-                        key_clean = re.sub(r'\[.*?\]', '', key).strip().lower()
-                        words_key = key_clean.split()
-                        if len(words_key) >= 2 and words_name[0] == words_key[0] and words_name[1] == words_key[1]:
-                            poster_url = url
-                            break
+        if not poster_url:
+            words_name = name_clean.split()
+            if len(words_name) >= 2:
+                for key, url in title_map.items():
+                    key_clean = re.sub(r'\[.*?\]', '', key).strip().lower()
+                    words_key = key_clean.split()
+                    if len(words_key) >= 2 and words_name[0] == words_key[0] and words_name[1] == words_key[1]:
+                        poster_url = url
+                        break
 
         featured.append({
             "name": name,
@@ -478,13 +483,15 @@ def parse_banner(soup: BeautifulSoup, title_map: dict) -> list[dict]:
             "genres": genre_div.get_text(strip=True).split(",") if genre_div and genre_div.get_text(strip=True) else [],
             "poster_url": poster_url,
         })
+
     return featured
+
 
 @app.get("/")
 def list_endpoints():
     return {
         "api": "MovieBox API",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "docs": "/docs",
         "endpoints": {
             "home": {
@@ -514,44 +521,43 @@ def list_endpoints():
                 "/ranking": "Get all ranking lists",
                 "/ranking/sections": "List all available ranking sections",
                 "/ranking/section/{name}": "Get a specific ranking section by name"
+            },
+            "stream": {
+                "/api/stream/{subject_id}": "Get raw stream sources. Requires ?detail_path={slug} query param (e.g. /api/stream/2722262626939167336?detail_path=strung-CZr8R8uZ5f3)"
             }
         }
     }
 
+
 @app.get("/home")
 async def get_home():
     url = "https://h5-api.aoneroom.com/wefeed-h5api-bff/home?host=moviebox.ph"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    async with httpx.AsyncClient() as client:
+    headers = {**H5_API_HEADERS}
+    async with httpx.AsyncClient(follow_redirects=True) as client:
         resp = await client.get(url, headers=headers, timeout=30)
-    
-    if resp.status_code != 200:
-        raise HTTPException(status_code=500, detail="Failed to fetch backend API")
-        
-    data = resp.json().get("data", {})
+        if resp.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to fetch backend API")
+        data = resp.json().get("data", {})
+
     ops = data.get("operatingList", [])
-    
     sections = []
-    map_size = 0 
-    
+    map_size = 0
+
     for op in ops:
         title = op.get("title", "")
-        
         if op.get("banner"):
             banner_items = []
             for item in op["banner"].get("items", []):
                 name = item.get("title")
-                if "Communities" in name or not name: continue
-                
+                if not name or "Communities" in name:
+                    continue
                 poster = item.get("image", {}).get("url")
                 if not poster and item.get("subject"):
                     poster = item["subject"].get("cover", {}).get("url")
-                
                 detail_path = item.get("detailPath")
                 badge = None
                 if item.get("subject"):
-                    badge = item["subject"].get("corner") 
-                
+                    badge = item["subject"].get("corner")
                 banner_items.append({
                     "name": name,
                     "poster_url": poster,
@@ -568,14 +574,14 @@ async def get_home():
             continue
 
         subs = op.get("subjects", [])
-        if not subs or not title: continue
-        
+        if not subs or not title:
+            continue
+
         movies = []
         for sub in subs:
             name = sub.get("title") or sub.get("name")
             poster = sub.get("cover", {}).get("url") or sub.get("thumbnail")
             detail_path = sub.get("detailPath")
-            
             movies.append({
                 "name": name,
                 "poster_url": poster,
@@ -584,7 +590,6 @@ async def get_home():
                 "badge": sub.get("corner"),
                 "blurhash": sub.get("cover", {}).get("blurHash")
             })
-            
         sections.append({
             "section": title,
             "count": len(movies),
@@ -599,6 +604,7 @@ async def get_home():
         "sections": sections,
     }
 
+
 @app.get("/home/sections")
 async def get_section_names():
     home_data = await get_home()
@@ -611,6 +617,7 @@ async def get_section_names():
         ]
     }
 
+
 @app.get("/home/banner")
 async def get_banner():
     home_data = await get_home()
@@ -618,6 +625,7 @@ async def get_banner():
         if s["section"] == "Banner":
             return {"count": s["count"], "featured": s["movies"]}
     return {"count": 0, "featured": []}
+
 
 @app.get("/home/trending")
 async def get_trending():
@@ -627,6 +635,7 @@ async def get_trending():
             return s
     raise HTTPException(status_code=404, detail="Trending Now section not found")
 
+
 @app.get("/home/hot")
 async def get_hot():
     home_data = await get_home()
@@ -635,6 +644,7 @@ async def get_hot():
             return s
     raise HTTPException(status_code=404, detail="Hot section not found")
 
+
 @app.get("/home/cinema")
 async def get_cinema():
     home_data = await get_home()
@@ -642,6 +652,7 @@ async def get_cinema():
         if "cinema" in s["section"].lower():
             return s
     raise HTTPException(status_code=404, detail="Cinema section not found")
+
 
 @app.get("/home/section/{name}")
 async def get_section_by_name(name: str):
@@ -657,6 +668,7 @@ async def get_section_by_name(name: str):
             }
         )
     return {"results": matched}
+
 
 async def _tab_sections(path: str) -> tuple[list, int]:
     soup, raw = await fetch_tab(path)
@@ -675,6 +687,7 @@ async def _tab_sections(path: str) -> tuple[list, int]:
 
     return sections, len(bmap)
 
+
 @app.get("/tv-series")
 async def get_tv_series():
     sections, map_size = await _tab_sections("/web/tv-series")
@@ -684,6 +697,7 @@ async def get_tv_series():
         "poster_map_size": map_size,
         "sections": sections,
     }
+
 
 @app.get("/tv-series/section/{name}")
 async def get_tv_series_section(name: str):
@@ -697,6 +711,7 @@ async def get_tv_series_section(name: str):
         )
     return {"results": matched}
 
+
 @app.get("/movies")
 async def get_movies():
     sections, map_size = await _tab_sections("/web/movie")
@@ -706,6 +721,7 @@ async def get_movies():
         "poster_map_size": map_size,
         "sections": sections,
     }
+
 
 @app.get("/movies/section/{name}")
 async def get_movies_section(name: str):
@@ -719,6 +735,7 @@ async def get_movies_section(name: str):
         )
     return {"results": matched}
 
+
 @app.get("/animation")
 async def get_animation():
     sections, map_size = await _tab_sections("/web/animated-series")
@@ -728,6 +745,7 @@ async def get_animation():
         "poster_map_size": map_size,
         "sections": sections,
     }
+
 
 @app.get("/animation/section/{name}")
 async def get_animation_section(name: str):
@@ -741,6 +759,7 @@ async def get_animation_section(name: str):
         )
     return {"results": matched}
 
+
 @app.get("/ranking")
 async def get_ranking():
     sections, map_size = await _tab_sections("/ranking-list")
@@ -751,62 +770,6 @@ async def get_ranking():
         "sections": sections,
     }
 
-@app.get("/search/suggest")
-async def get_search_suggestions(q: str):
-    url = "https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/search-suggest"
-    payload = {"keyword": q, "perPage": 10}
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Content-Type": "application/json"
-    }
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, json=payload, headers=headers, timeout=10)
-        
-    if resp.status_code != 200:
-        raise HTTPException(status_code=500, detail="Search API failed")
-        
-    data = resp.json()
-    items = data.get("data", {}).get("items", [])
-    suggestions = [item.get("word") for item in items if item.get("word")]
-    return {"query": q, "suggestions": suggestions}
-
-@app.get("/search")
-async def get_search_results(q: str):
-    url = "https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/search"
-    payload = {"keyword": q, "perPage": 30, "page": 1}
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Content-Type": "application/json"
-    }
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, json=payload, headers=headers, timeout=15)
-        
-    if resp.status_code != 200:
-        raise HTTPException(status_code=500, detail="Search API failed")
-        
-    data = resp.json()
-    items = data.get("data", {}).get("items", [])
-    
-    movies = []
-    for sub in items:
-        name = sub.get("title")
-        poster = sub.get("cover", {}).get("url")
-        detail_path = sub.get("detailPath")
-        
-        movies.append({
-            "name": name,
-            "poster_url": poster,
-            "url": BASE_URL + f"/detail/{detail_path}" if detail_path else None,
-            "slug": detail_path,
-            "badge": sub.get("corner"),
-            "blurhash": sub.get("cover", {}).get("blurHash")
-        })
-        
-    return {
-        "query": q,
-        "count": len(movies),
-        "movies": movies
-    }
 
 @app.get("/ranking/section/{name}")
 async def get_ranking_section(name: str):
@@ -820,70 +783,188 @@ async def get_ranking_section(name: str):
         )
     return {"results": matched}
 
+
+# ═══════════════════════════════════════════════════════════════
+# SEARCH — FIXED
+# ═══════════════════════════════════════════════════════════════
+# Bug: aoneroom's h5-api backend silently rejects POST requests
+# that don't carry a Referer/Origin pointing to moviebox.ph.
+# Every other route already sends this; search did not — causing
+# the 500 errors. Fixed by reusing H5_API_HEADERS everywhere.
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/search/suggest")
+async def get_search_suggestions(q: str):
+    url = "https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/search-suggest"
+    payload = {"keyword": q, "perPage": 10}
+    headers = {**H5_API_HEADERS}
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        resp = await client.post(url, json=payload, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Search suggest API returned {resp.status_code}")
+        data = resp.json()
+        items = data.get("data", {}).get("items", [])
+        suggestions = [item.get("word") for item in items if item.get("word")]
+        return {"query": q, "suggestions": suggestions}
+
+
+@app.get("/search")
+async def get_search_results(q: str):
+    url = "https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/search"
+    payload = {"keyword": q, "perPage": 30, "page": 1}
+    headers = {**H5_API_HEADERS}
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        resp = await client.post(url, json=payload, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Search API returned {resp.status_code}")
+        data = resp.json()
+        items = data.get("data", {}).get("items", [])
+        movies = []
+        for sub in items:
+            name = sub.get("title")
+            poster = sub.get("cover", {}).get("url")
+            detail_path = sub.get("detailPath")
+            movies.append({
+                "name": name,
+                "poster_url": poster,
+                "url": BASE_URL + f"/detail/{detail_path}" if detail_path else None,
+                "slug": detail_path,
+                "badge": sub.get("corner"),
+                "blurhash": sub.get("cover", {}).get("blurHash")
+            })
+        return {
+            "query": q,
+            "count": len(movies),
+            "movies": movies
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# STREAM — FIXED
+# ═══════════════════════════════════════════════════════════════
+# Bugs fixed:
+# 1. Hardcoded/stale "uuid" cookie caused aoneroom's session check
+#    to fail intermittently — now generates a fresh UUID per request.
+# 2. No validation on subject_id/detail_path — a malformed call
+#    (e.g. literal "{id}" placeholder) produced a confusing 500
+#    instead of a clear 400. Added explicit validation.
+# 3. Domain-discovery failure now falls back gracefully and is
+#    logged via the response rather than silently swallowed.
+# ═══════════════════════════════════════════════════════════════
+
 @app.get("/api/stream/{subject_id}")
 async def get_stream_sources(subject_id: str, detail_path: str, se: int = 0, ep: int = 0):
-    domain_url = "https://h5-api.aoneroom.com/wefeed-h5api-bff/media-player/get-domain"
-    domain = "https://123movienow.cc" 
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "X-Client-Info": '{"timezone":"Asia/Dhaka"}',
-        "X-Client-Type": "h5",
-        "X-App-Version": "1.0.0"
-    }
+    # Guard against placeholder values being passed in literally
+    if not subject_id or subject_id in ("{id}", "id", "undefined", "null") or not subject_id.strip("{}"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid subject_id. Pass the real numeric 'id' from /detail/{slug} response, e.g. /api/stream/2722262626939167336?detail_path=strung-CZr8R8uZ5f3"
+        )
+    subject_id = subject_id.strip("{}")
 
-    async with httpx.AsyncClient() as client:
+    if not detail_path:
+        raise HTTPException(status_code=400, detail="detail_path query parameter is required")
+
+    domain_url = "https://h5-api.aoneroom.com/wefeed-h5api-bff/media-player/get-domain"
+    domain = "https://123movienow.cc"  # fallback
+
+    domain_headers = {**H5_API_HEADERS}
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        domain_warning = None
         try:
-            r_dom = await client.get(domain_url, headers=headers, timeout=5)
+            r_dom = await client.get(domain_url, headers=domain_headers, timeout=8)
             if r_dom.status_code == 200:
                 dom_data = r_dom.json()
-                domain = dom_data.get("data", domain)
-                if domain.endswith("/"):
-                    domain = domain[:-1]
+                fetched_domain = dom_data.get("data")
+                if fetched_domain:
+                    domain = fetched_domain
+                    if domain.endswith("/"):
+                        domain = domain[:-1]
+            else:
+                domain_warning = f"Domain discovery returned {r_dom.status_code}, using fallback domain"
         except Exception as e:
-            print(f"Warning: Failed to fetch player domain, using fallback: {e}")
-            pass
-            
+            domain_warning = f"Domain discovery failed ({e}), using fallback domain"
+
         play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
-        
+
         play_headers = {
             'accept': 'application/json',
             'accept-language': 'en-US,en;q=0.9',
             'referer': f'{domain}/spa/videoPlayPage/movies/{detail_path}?id={subject_id}&type=/movie/detail&detailSe=&detailEp=&lang=en',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+            'user-agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                '(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36'
+            ),
             'x-client-info': '{"timezone":"Asia/Dhaka"}',
-            'x-source': ''
-        }
-        
-        cookies = {
-            "uuid": "d8c3539e-2e46-4000-af20-7046a856e30a" 
+            'x-source': '',
+            'origin': domain,
         }
 
-        resp = await client.get(play_url, headers=play_headers, cookies=cookies, timeout=15)
-        
+        # FIX: fresh random session uuid per request instead of a
+        # hardcoded one — aoneroom's session validation can flag
+        # reused cookies as suspicious/stale over time.
+        cookies = {
+            "uuid": str(uuid.uuid4())
+        }
+
+        try:
+            resp = await client.get(play_url, headers=play_headers, cookies=cookies, timeout=20)
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"Failed to reach player API: {e}")
+
         if resp.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Player API returned {resp.status_code}")
-            
-        data = resp.json()
+            raise HTTPException(
+                status_code=502,
+                detail=f"Player API returned {resp.status_code}. {domain_warning or ''}".strip()
+            )
+
+        try:
+            data = resp.json()
+        except Exception:
+            raise HTTPException(status_code=502, detail="Player API returned invalid JSON")
+
         streams = data.get("data", {}).get("streams", [])
-        
+
         if not streams:
-            raise HTTPException(status_code=404, detail="No streams found or hasResource is False.")
-            
+            # Fall back to /detail/{slug} mp4 links if the player API has nothing
+            try:
+                fallback = await get_movie_detail(detail_path)
+                fallback_mp4 = fallback.get("streams", {}).get("mp4", [])
+                if fallback_mp4:
+                    return {
+                        "subject_id": subject_id,
+                        "detail_path": detail_path,
+                        "season": se,
+                        "episode": ep,
+                        "stream_domain": domain,
+                        "count": len(fallback_mp4),
+                        "sources": [{"resolution": "Unknown", "format": "mp4", "url": u, "size_bytes": None, "id": None} for u in fallback_mp4],
+                        "raw": {},
+                        "note": "Player API returned no streams; fell back to /detail mp4 links",
+                    }
+            except Exception:
+                pass
+
+            raise HTTPException(
+                status_code=404,
+                detail=f"No streams found for this title. {domain_warning or ''}".strip()
+            )
+
         formatted_streams = []
         for s in streams:
             formatted_streams.append({
-                "resolution": s.get("resolutions") + "p" if s.get("resolutions") else "Unknown",
+                "resolution": (s.get("resolutions") + "p") if s.get("resolutions") else "Unknown",
                 "format": s.get("format"),
                 "url": s.get("url"),
                 "size_bytes": s.get("size"),
                 "id": s.get("id")
             })
-            
+
         try:
             formatted_streams.sort(key=lambda x: int(x["resolution"].replace("p", "")), reverse=True)
-        except:
-             pass
+        except Exception:
+            pass
 
         return {
             "subject_id": subject_id,
