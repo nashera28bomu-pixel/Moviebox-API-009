@@ -3,9 +3,9 @@ import re
 import json
 import httpx
 import asyncio
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 app = FastAPI(
     title="MovieBox API Pro",
@@ -594,6 +594,55 @@ async def get_captions(subject_id: str, detail_path: str, se: int = 1, ep: int =
     inner = data.get("data", {})
     captions = inner.get("captions", []) if isinstance(inner, dict) else inner
     return {"subject_id": subject_id, "se": se, "ep": ep, "count": len(captions), "captions": captions}
+
+@app.get("/proxy")
+async def proxy(request: Request, url: str = Query(..., description="Direct CDN URL to stream through this backend")):
+    """Streams video/subtitle bytes through this backend with the Referer/
+    User-Agent the CDN expects, and forwards Range requests so <video>
+    seeking works correctly. Frontend should point <video src> at this
+    instead of the raw CDN url returned by /api/stream."""
+    range_header = request.headers.get("range")
+    headers = {
+        "Referer": "https://netfilm.world/",
+        "Origin": "https://netfilm.world",
+        "User-Agent": PLAYER_HEADERS["User-Agent"],
+    }
+    if range_header:
+        headers["Range"] = range_header
+
+    client = httpx.AsyncClient(timeout=None, follow_redirects=True)
+    try:
+        upstream_req = client.build_request("GET", url, headers=headers)
+        upstream_resp = await client.send(upstream_req, stream=True)
+    except Exception as exc:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"upstream fetch failed: {exc}")
+
+    if upstream_resp.status_code >= 400:
+        await upstream_resp.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=upstream_resp.status_code, detail="upstream returned an error")
+
+    passthrough_headers = {}
+    for h in ("content-type", "content-length", "content-range", "accept-ranges"):
+        if h in upstream_resp.headers:
+            passthrough_headers[h] = upstream_resp.headers[h]
+    passthrough_headers.setdefault("accept-ranges", "bytes")
+
+    async def body_iterator():
+        try:
+            async for chunk in upstream_resp.aiter_bytes(chunk_size=64 * 1024):
+                yield chunk
+        finally:
+            await upstream_resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        body_iterator(),
+        status_code=upstream_resp.status_code,
+        headers=passthrough_headers,
+        media_type=passthrough_headers.get("content-type", "application/octet-stream"),
+    )
 
 if __name__ == "__main__":
     import uvicorn
