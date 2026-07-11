@@ -1,3 +1,4 @@
+import os
 import re
 import json
 import httpx
@@ -9,7 +10,7 @@ from fastapi.responses import HTMLResponse
 app = FastAPI(
     title="MovieBox API Pro",
     description="Full Pure REST API for moviebox.ph — Zero Scraping",
-    version="2.1.5"
+    version="2.1.6"
 )
 
 app.add_middleware(
@@ -21,6 +22,10 @@ app.add_middleware(
 
 BASE_URL = "https://moviebox.ph"
 API_BASE = "https://h5-api.aoneroom.com/wefeed-h5api-bff"
+
+# ScrapingBee key — set this in Railway's Variables tab as SCRAPINGBEE_API_KEY,
+# do NOT hardcode a real key here if this repo is public.
+SCRAPINGBEE_API_KEY = os.environ.get("SCRAPINGBEE_API_KEY", "")
 
 _bearer_token: str | None = None
 
@@ -106,6 +111,39 @@ async def _make_request(url: str, method: str = "GET", payload: dict = None, cus
             if isinstance(e, HTTPException): raise e
             raise HTTPException(status_code=502, detail=f"Request failed: {str(e)}")
 
+async def _scrapingbee_get_json(target_url: str, referer: str) -> dict:
+    """Fetch a JSON endpoint through ScrapingBee to dodge datacenter IP blocks.
+    Used only for the stream-discovery ('play') call, which is the one that
+    gets blocked when hit directly from Render/Railway's shared IPs."""
+    if not SCRAPINGBEE_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="SCRAPINGBEE_API_KEY is not set. Add it in Railway → Variables."
+        )
+    params = {
+        "api_key": SCRAPINGBEE_API_KEY,
+        "url": target_url,
+        "render_js": "false",
+        "forward_headers": "true",
+    }
+    headers = {
+        "Spb-Referer": referer,
+        "Spb-User-Agent": PLAYER_HEADERS["User-Agent"],
+        "Spb-Accept": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            resp = await client.get("https://app.scrapingbee.com/api/v1/", params=params, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"ScrapingBee request failed: {e.response.status_code} — {e.response.text[:200]}"
+            )
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"ScrapingBee request failed: {str(e)}")
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     html_content = """
@@ -128,14 +166,14 @@ async def dashboard():
             }
 
             * { margin: 0; padding: 0; box-sizing: border-box; }
-            
+
             body {
                 font-family: 'Outfit', sans-serif;
                 background: var(--bg);
                 color: var(--text);
                 overflow-x: hidden;
                 min-height: 100vh;
-                background-image: 
+                background-image:
                     radial-gradient(circle at 10% 10%, rgba(255, 61, 113, 0.12) 0%, transparent 40%),
                     radial-gradient(circle at 90% 90%, rgba(51, 102, 255, 0.12) 0%, transparent 40%);
             }
@@ -344,7 +382,7 @@ async def dashboard():
 
                 <div class="card">
                     <div class="card-title"><i>🎬</i> Stream Engine</div>
-                    <p class="card-desc">Dynamic domain discovery and direct MP4 extraction. Supports multiple resolutions and qualities.</p>
+                    <p class="card-desc">Dynamic domain discovery and direct MP4 extraction, resolved through ScrapingBee to avoid datacenter IP blocks. Supports multiple resolutions and qualities.</p>
                     <div class="endpoint">/api/stream/{subject_id}</div>
                     <a href="/api/stream/56988683026712168?detail_path=attack-on-titan-hindi-kGWQOIx0d4" target="_blank" class="btn">Get Player Link</a>
                 </div>
@@ -483,9 +521,10 @@ async def get_stream_sources(subject_id: str, detail_path: str, se: int = 1, ep:
     )
     play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
-        resp = await client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
-        data = resp.json().get("data", {})
+    # Step 3: resolve the actual stream through ScrapingBee — this is the
+    # call that gets blocked when made directly from Render/Railway IPs.
+    resp_json = await _scrapingbee_get_json(play_url, player_referer)
+    data = resp_json.get("data", {})
 
     has_resource = data.get("hasResource", False)
     streams = [
@@ -523,9 +562,8 @@ async def get_captions(subject_id: str, detail_path: str, se: int = 1, ep: int =
     )
     play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
-        play_resp = await client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
-        play_data = play_resp.json().get("data", {})
+    resp_json = await _scrapingbee_get_json(play_url, player_referer)
+    play_data = resp_json.get("data", {})
 
     streams = play_data.get("streams", [])
     dash = play_data.get("dash", [])
@@ -553,4 +591,4 @@ async def get_captions(subject_id: str, detail_path: str, se: int = 1, ep: int =
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("newapi:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
