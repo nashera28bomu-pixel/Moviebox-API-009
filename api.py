@@ -139,10 +139,16 @@ async def _scrapingbee_get_json(target_url: str, referer: str) -> dict:
         except httpx.HTTPStatusError as e:
             raise HTTPException(
                 status_code=502,
-                detail=f"ScrapingBee request failed: {e.response.status_code} — {e.response.text[:200]}"
+                detail=(
+                    f"ScrapingBee request failed: {e.response.status_code} — "
+                    f"{e.response.text[:200]} | target_url_sent={target_url}"
+                )
             )
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"ScrapingBee request failed: {str(e)}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"ScrapingBee request failed: {str(e)} | target_url_sent={target_url}"
+            )
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
